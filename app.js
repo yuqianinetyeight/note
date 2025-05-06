@@ -3,120 +3,6 @@ const gun = Gun({
     peers: ['https://gun-manhattan.herokuapp.com/gun']
 });
 
-// 建立共同瀏覽的資料節點
-const browser = gun.get('coBrowser');
-const users = gun.get('coUsers');
-let myId = Math.random().toString(36).substr(2, 9);
-let myName = '訪客 ' + myId.substr(0, 4);
-
-// DOM 元素
-const urlInput = document.getElementById('urlInput');
-const browserFrame = document.getElementById('browserFrame');
-const usernameInput = document.getElementById('username');
-const viewerCount = document.getElementById('viewerCount');
-const cursorsContainer = document.getElementById('cursors');
-
-// 設定使用者名稱
-usernameInput.value = myName;
-usernameInput.addEventListener('change', () => {
-    myName = usernameInput.value || myName;
-    updateUserStatus();
-});
-
-// 更新使用者狀態
-function updateUserStatus() {
-    users.get(myId).put({
-        name: myName,
-        lastSeen: Date.now(),
-        online: true
-    });
-}
-
-// 定期更新在線狀態
-setInterval(updateUserStatus, 2000);
-
-// 監聽使用者離線
-window.addEventListener('beforeunload', () => {
-    users.get(myId).put({ online: false });
-});
-
-// 導航功能
-function navigateTo() {
-    const url = urlInput.value;
-    if (url) {
-        browser.get('currentUrl').put(url);
-    }
-}
-
-// 監聽 URL 變化
-browser.get('currentUrl').on((url) => {
-    if (url && url !== urlInput.value) {
-        urlInput.value = url;
-        browserFrame.src = url;
-    }
-});
-
-// 追蹤滾動位置
-browserFrame.addEventListener('load', () => {
-    browserFrame.contentWindow.addEventListener('scroll', () => {
-        browser.get('scroll').put({
-            x: browserFrame.contentWindow.scrollX,
-            y: browserFrame.contentWindow.scrollY
-        });
-    });
-});
-
-browser.get('scroll').on((pos) => {
-    if (pos && browserFrame.contentWindow) {
-        browserFrame.contentWindow.scrollTo(pos.x || 0, pos.y || 0);
-    }
-});
-
-// 追蹤滑鼠位置
-document.addEventListener('mousemove', (e) => {
-    browser.get('cursors').get(myId).put({
-        x: e.clientX,
-        y: e.clientY,
-        name: myName
-    });
-});
-
-// 更新其他使用者的游標
-browser.get('cursors').map().on((data, id) => {
-    if (id !== myId && data) {
-        let cursor = document.getElementById(`cursor-${id}`);
-        if (!cursor) {
-            cursor = document.createElement('div');
-            cursor.id = `cursor-${id}`;
-            cursor.className = 'cursor';
-            cursorsContainer.appendChild(cursor);
-        }
-        cursor.style.transform = `translate(${data.x}px, ${data.y}px)`;
-        cursor.setAttribute('data-name', data.name || '訪客');
-    }
-});
-
-// 清理離線使用者的游標
-users.map().on((data, id) => {
-    if (data && !data.online) {
-        const cursor = document.getElementById(`cursor-${id}`);
-        if (cursor) {
-            cursor.remove();
-        }
-    }
-});
-
-// 更新在線人數
-setInterval(() => {
-    let count = 0;
-    users.map().once((data) => {
-        if (data && data.online && Date.now() - data.lastSeen < 5000) {
-            count++;
-        }
-    });
-    viewerCount.textContent = `${count} 位使用者在線`;
-}, 1000);
-
 // 遊戲常量
 const ROLES = {
     VILLAGER: '村民',
@@ -227,14 +113,20 @@ function subscribeToRoom(roomId) {
 
 // 更新玩家列表
 function updatePlayerList(player) {
-    const playerDiv = document.getElementById(`player-${player.id}`) || document.createElement('div');
-    playerDiv.id = `player-${player.id}`;
+    if (!player) return;
+    
+    let playerDiv = document.getElementById(`player-${player.id}`);
+    if (!playerDiv) {
+        playerDiv = document.createElement('div');
+        playerDiv.id = `player-${player.id}`;
+        elements.playerList.appendChild(playerDiv);
+    }
+    
     playerDiv.className = 'list-group-item d-flex justify-content-between align-items-center';
     playerDiv.innerHTML = `
         ${player.name}
         ${player.isHost ? '<span class="badge bg-primary">房主</span>' : ''}
     `;
-    elements.playerList.appendChild(playerDiv);
 }
 
 // 開始遊戲
@@ -258,16 +150,24 @@ function handleStartGame() {
     const roles = assignRoles(players);
     
     // 更新遊戲狀態
-    const gameState = {
+    const initialState = {
         phase: GAME_PHASES.NIGHT_WEREWOLF,
         round: 1,
         roles: roles,
         alive: players.map(p => p.id),
         votes: {},
-        nightActions: {}
+        nightActions: {},
+        witch: {
+            usedSave: false,
+            usedPoison: false
+        },
+        discussion: {
+            speaking: null,
+            timeLeft: 60
+        }
     };
 
-    gun.get(`werewolf_room_${currentRoom}`).get('gameState').put(gameState);
+    gun.get(`werewolf_room_${currentRoom}`).get('gameState').put(initialState);
     showGameArea();
 }
 
@@ -301,8 +201,13 @@ function assignRoles(players) {
 function updateGameState() {
     if (!gameState) return;
 
-    // 更新遊戲階段顯示
     elements.gameStatus.textContent = `第 ${gameState.round} 回合 - ${gameState.phase}`;
+    
+    if (gameState.phase.includes('NIGHT')) {
+        document.body.classList.add('night-mode');
+    } else {
+        document.body.classList.remove('night-mode');
+    }
     
     // 如果是新的一輪開始，顯示角色
     if (gameState.round === 1 && !myRole) {
@@ -310,10 +215,7 @@ function updateGameState() {
         showRole();
     }
     
-    // 根據遊戲階段更新操作區域
     updateActionArea();
-    
-    // 更新玩家板塊
     updatePlayerBoard();
 }
 
@@ -349,6 +251,9 @@ function updateActionArea() {
                 showWitchActions();
             }
             break;
+        case GAME_PHASES.DAY_DISCUSSION:
+            showDiscussionActions();
+            break;
         case GAME_PHASES.DAY_VOTE:
             showVoteActions();
             break;
@@ -357,6 +262,11 @@ function updateActionArea() {
 
 // 狼人行動介面
 function showWerewolfActions() {
+    if (hasVoted('werewolfVotes')) {
+        elements.actionArea.innerHTML = '<div class="alert alert-info">已提交選擇，等待其他狼人...</div>';
+        return;
+    }
+
     elements.actionArea.innerHTML = `
         <div class="alert alert-danger">
             請選擇要擊殺的玩家
@@ -381,15 +291,46 @@ function showWitchActions() {
             ${deadPlayer ? `今晚被殺的是：${getPlayerName(deadPlayer)}` : '今晚沒有人被殺'}
         </div>
         <div class="btn-group">
-            <button onclick="usePotion('save')" class="btn btn-success" ${gameState.witch?.usedSave ? 'disabled' : ''}>使用解藥</button>
-            <button onclick="showPoisonOptions()" class="btn btn-danger" ${gameState.witch?.usedPoison ? 'disabled' : ''}>使用毒藥</button>
+            ${!gameState.witch.usedSave && deadPlayer ? 
+                `<button onclick="usePotion('save')" class="btn btn-success">使用解藥</button>` : ''}
+            ${!gameState.witch.usedPoison ? 
+                `<button onclick="showPoisonOptions()" class="btn btn-danger">使用毒藥</button>` : ''}
             <button onclick="skipWitchAction()" class="btn btn-secondary">跳過</button>
         </div>
     `;
 }
 
+// 討論階段介面
+function showDiscussionActions() {
+    const { speaking, timeLeft } = gameState.discussion;
+    
+    if (!speaking) {
+        elements.actionArea.innerHTML = `
+            <button onclick="startSpeaking()" class="btn btn-primary">要求發言</button>
+        `;
+    } else if (speaking === currentPlayer.id) {
+        elements.actionArea.innerHTML = `
+            <div class="alert alert-info">
+                你正在發言中 (剩餘 ${timeLeft} 秒)
+            </div>
+            <button onclick="endSpeaking()" class="btn btn-secondary">結束發言</button>
+        `;
+    } else {
+        elements.actionArea.innerHTML = `
+            <div class="alert alert-info">
+                ${getPlayerName(speaking)} 正在發言 (剩餘 ${timeLeft} 秒)
+            </div>
+        `;
+    }
+}
+
 // 投票介面
 function showVoteActions() {
+    if (hasVoted('votes')) {
+        elements.actionArea.innerHTML = '<div class="alert alert-info">已提交投票，等待其他玩家...</div>';
+        return;
+    }
+
     elements.actionArea.innerHTML = `
         <div class="alert alert-primary">
             請選擇要投票處決的玩家
@@ -397,13 +338,80 @@ function showVoteActions() {
     `;
 }
 
+// 更新玩家板塊
+function updatePlayerBoard() {
+    elements.playerBoard.innerHTML = '';
+    
+    const players = Array.from(elements.playerList.children);
+    players.forEach(playerEl => {
+        const playerId = playerEl.id.replace('player-', '');
+        const playerName = playerEl.textContent.trim();
+        const isAlive = gameState.alive.includes(playerId);
+        
+        const card = document.createElement('div');
+        card.className = `col-md-4 player-card ${isAlive ? '' : 'dead'}`;
+        card.dataset.playerId = playerId;
+        card.innerHTML = `
+            <h4>${playerName}</h4>
+            <p>${isAlive ? '存活' : '死亡'}</p>
+        `;
+        
+        if (isAlive && canSelectPlayer(playerId)) {
+            card.classList.add('selectable');
+            card.addEventListener('click', () => handlePlayerSelect(playerId));
+        }
+        
+        elements.playerBoard.appendChild(card);
+    });
+}
+
+// 檢查是否已投票
+function hasVoted(voteType) {
+    const votes = gameState[voteType] || {};
+    return votes[currentPlayer.id] !== undefined;
+}
+
+// 判斷是否可以選擇玩家
+function canSelectPlayer(targetId) {
+    if (!currentPlayer.alive || targetId === currentPlayer.id) return false;
+    
+    const { phase } = gameState;
+    switch (phase) {
+        case GAME_PHASES.NIGHT_WEREWOLF:
+            return myRole === ROLES.WEREWOLF && !hasVoted('werewolfVotes');
+        case GAME_PHASES.NIGHT_SEER:
+            return myRole === ROLES.SEER;
+        case GAME_PHASES.NIGHT_WITCH:
+            return myRole === ROLES.WITCH && !gameState.witch.usedPoison;
+        case GAME_PHASES.DAY_VOTE:
+            return !hasVoted('votes');
+        default:
+            return false;
+    }
+}
+
+// 處理玩家選擇
+function handlePlayerSelect(targetId) {
+    const { phase } = gameState;
+    
+    switch (phase) {
+        case GAME_PHASES.NIGHT_WEREWOLF:
+            submitWerewolfVote(targetId);
+            break;
+        case GAME_PHASES.NIGHT_SEER:
+            checkPlayerRole(targetId);
+            break;
+        case GAME_PHASES.NIGHT_WITCH:
+            handleWitchAction(targetId);
+            break;
+        case GAME_PHASES.DAY_VOTE:
+            submitDayVote(targetId);
+            break;
+    }
+}
+
 // 狼人投票
 function submitWerewolfVote(targetId) {
-    if (targetId === currentPlayer.id) {
-        alert('不能選擇自己！');
-        return;
-    }
-
     gun.get(`werewolf_room_${currentRoom}`).get('gameState').get('nightActions').get('werewolfVotes').get(currentPlayer.id).put(targetId);
     addGameLog('你已提交投票');
     
@@ -487,31 +495,74 @@ function usePotion(type, targetId = null) {
     updateGamePhase(GAME_PHASES.DAY_DISCUSSION);
 }
 
-// 顯示毒藥選項
-function showPoisonOptions() {
-    elements.actionArea.innerHTML = `
-        <div class="alert alert-danger">
-            請選擇要毒殺的玩家
-        </div>
-    `;
-}
-
 // 跳過女巫行動
 function skipWitchAction() {
     updateGamePhase(GAME_PHASES.DAY_DISCUSSION);
+    processDayStart();
 }
 
-// 提交白天投票
-function submitDayVote(targetId) {
-    if (targetId === currentPlayer.id) {
-        alert('不能投票給自己！');
-        return;
+// 處理白天開始
+function processDayStart() {
+    const { werewolfKill } = gameState.nightActions;
+    const { witch } = gameState;
+    
+    // 處理夜晚的死亡情況
+    let nightDeaths = [];
+    
+    if (werewolfKill && (!witch.savedPlayer || witch.savedPlayer !== werewolfKill)) {
+        nightDeaths.push(werewolfKill);
     }
+    
+    if (witch.poisonedPlayer) {
+        nightDeaths.push(witch.poisonedPlayer);
+    }
+    
+    // 更新存活玩家列表
+    const newAlive = gameState.alive.filter(id => !nightDeaths.includes(id));
+    gun.get(`werewolf_room_${currentRoom}`).get('gameState').get('alive').put(newAlive);
+    
+    // 添加死亡通知
+    nightDeaths.forEach(playerId => {
+        addGameLog(`${getPlayerName(playerId)} 在昨晚死亡`, 'death');
+    });
+    
+    // 檢查遊戲是否結束
+    if (!checkGameEnd()) {
+        startDiscussion();
+    }
+}
 
+// 開始討論階段
+function startDiscussion() {
+    gun.get(`werewolf_room_${currentRoom}`).get('gameState').get('discussion').put({
+        speaking: null,
+        timeLeft: 60
+    });
+}
+
+// 要求發言
+function startSpeaking() {
+    gun.get(`werewolf_room_${currentRoom}`).get('gameState').get('discussion').put({
+        speaking: currentPlayer.id,
+        timeLeft: 60
+    });
+}
+
+// 結束發言
+function endSpeaking() {
+    if (gameState.discussion.speaking === currentPlayer.id) {
+        gun.get(`werewolf_room_${currentRoom}`).get('gameState').get('discussion').put({
+            speaking: null,
+            timeLeft: 0
+        });
+    }
+}
+
+// 提交投票
+function submitDayVote(targetId) {
     gun.get(`werewolf_room_${currentRoom}`).get('gameState').get('votes').get(currentPlayer.id).put(targetId);
     addGameLog('你已提交投票');
     
-    // 檢查是否所有活著的玩家都已投票
     checkDayVotes();
 }
 
@@ -542,7 +593,6 @@ function checkDayVotes() {
         
         // 檢查遊戲是否結束
         if (!checkGameEnd()) {
-            // 進入下一輪
             startNewRound();
         }
     }
@@ -593,70 +643,13 @@ function getPlayerName(playerId) {
     return playerEl ? playerEl.textContent.trim() : '未知玩家';
 }
 
-// 更新玩家板塊
-function updatePlayerBoard() {
-    elements.playerBoard.innerHTML = '';
-    
-    const players = Array.from(elements.playerList.children);
-    players.forEach(playerEl => {
-        const playerId = playerEl.id.replace('player-', '');
-        const playerName = playerEl.textContent.trim();
-        const isAlive = gameState.alive.includes(playerId);
-        
-        const card = document.createElement('div');
-        card.className = `col-md-4 player-card ${isAlive ? '' : 'dead'}`;
-        card.dataset.playerId = playerId;
-        card.innerHTML = `
-            <h4>${playerName}</h4>
-            <p>${isAlive ? '存活' : '死亡'}</p>
-        `;
-        
-        if (isAlive && canSelectPlayer()) {
-            card.classList.add('selectable');
-            card.addEventListener('click', () => handlePlayerSelect(playerId));
-        }
-        
-        elements.playerBoard.appendChild(card);
-    });
-}
-
-// 判斷是否可以選擇玩家
-function canSelectPlayer() {
-    const { phase } = gameState;
-    if (!currentPlayer.alive) return false;
-    
-    switch (phase) {
-        case GAME_PHASES.NIGHT_WEREWOLF:
-            return myRole === ROLES.WEREWOLF;
-        case GAME_PHASES.NIGHT_SEER:
-            return myRole === ROLES.SEER;
-        case GAME_PHASES.NIGHT_WITCH:
-            return myRole === ROLES.WITCH;
-        case GAME_PHASES.DAY_VOTE:
-            return true;
-        default:
-            return false;
-    }
-}
-
-// 處理玩家選擇
-function handlePlayerSelect(targetId) {
-    const { phase } = gameState;
-    
-    switch (phase) {
-        case GAME_PHASES.NIGHT_WEREWOLF:
-            submitWerewolfVote(targetId);
-            break;
-        case GAME_PHASES.NIGHT_SEER:
-            checkPlayerRole(targetId);
-            break;
-        case GAME_PHASES.NIGHT_WITCH:
-            handleWitchAction(targetId);
-            break;
-        case GAME_PHASES.DAY_VOTE:
-            submitDayVote(targetId);
-            break;
-    }
+// 添加遊戲日誌
+function addGameLog(message, type = 'system') {
+    const logEntry = document.createElement('div');
+    logEntry.className = `log-entry ${type}`;
+    logEntry.textContent = message;
+    elements.gameLog.appendChild(logEntry);
+    elements.gameLog.scrollTop = elements.gameLog.scrollHeight;
 }
 
 // 離開遊戲
@@ -688,15 +681,6 @@ function showGameArea() {
     elements.loginArea.classList.add('d-none');
     elements.lobby.classList.add('d-none');
     elements.gameArea.classList.remove('d-none');
-}
-
-// 添加遊戲日誌
-function addGameLog(message, type = 'system') {
-    const logEntry = document.createElement('div');
-    logEntry.className = `log-entry ${type}`;
-    logEntry.textContent = message;
-    elements.gameLog.appendChild(logEntry);
-    elements.gameLog.scrollTop = elements.gameLog.scrollHeight;
 }
 
 // 初始顯示登入區域
